@@ -7,6 +7,9 @@ from decimal import Decimal
 from django.db import transaction
 from django.utils import timezone
 from datetime import timedelta
+from django.db.models import Count, Avg, Sum, F, ExpressionWrapper, fields
+from django.db.models.functions import TruncDate
+from rest_framework.permissions import IsAuthenticated
 
 from .models import Order, OrderItem, Product, Table, Review
 from .serializers import (
@@ -361,3 +364,108 @@ class TableViewSet(viewsets.ModelViewSet):
             pass
 
         return Response({'status': 'attended'})
+
+
+class DashboardViewSet(viewsets.ViewSet):
+    """
+    Versión con CÁLCULO MANUAL para asegurar compatibilidad total con fechas.
+    """
+    permission_classes = [IsAuthenticated]
+
+    @action(detail=False, methods=['get'])
+    def stats(self, request):
+        # 1. TRAER PEDIDOS (Pagados o Entregados)
+        target_statuses = [Order.Status.PAID, Order.Status.DELIVERED]
+
+        # Traemos TODOS los objetos ordenados.
+        # Nota: Al no usar .values() ni .annotate() de la DB, evitamos el error de SQLite.
+        orders = Order.objects.filter(status__in=target_statuses).order_by('created_at')
+
+        # --- VARIABLES PARA ACUMULAR DATOS ---
+        total_sales = Decimal('0.00')
+        sales_by_date_dict = {}  # Ejemplo: {"2025-11-26": 50.00}
+
+        prep_times = []  # Lista de segundos
+        prep_times_by_product = {}  # {"Hamburguesa": [600, 500]}
+
+        product_counts = {}  # {"Jugo": 5}
+
+        # --- BUCLE PRINCIPAL (Procesamos en Python) ---
+        for order in orders:
+            # A. Ventas Totales
+            total_sales += order.total_price
+
+            # B. Historial de Ventas
+            if order.created_at:
+                # Convertimos a string "YYYY-MM-DD" respetando zona horaria local
+                local_date = timezone.localtime(order.created_at).strftime("%Y-%m-%d")
+
+                if local_date not in sales_by_date_dict:
+                    sales_by_date_dict[local_date] = Decimal('0.00')
+                sales_by_date_dict[local_date] += order.total_price
+
+            # C. Productos y Tiempos
+            # (Nota: Esto hace consultas adicionales, pero para reportes de admin es aceptable)
+            items = order.items.all()
+
+            for item in items:
+                # Conteo Top Productos
+                p_name = item.product_name
+                if p_name not in product_counts:
+                    product_counts[p_name] = 0
+                product_counts[p_name] += 1
+
+                # Tiempos (Solo si la orden tiene inicio y fin)
+                if order.ready_at and order.created_at:
+                    duration = (order.ready_at - order.created_at).total_seconds()
+                    prep_times.append(duration)
+
+                    if p_name not in prep_times_by_product:
+                        prep_times_by_product[p_name] = []
+                    prep_times_by_product[p_name].append(duration)
+
+        # --- FORMATO DE SALIDA PARA EL FRONTEND ---
+
+        # 1. Historial de Ventas (Lista ordenada)
+        sales_history = [
+            {"date": date, "total": total}
+            for date, total in sales_by_date_dict.items()
+        ]
+        sales_history.sort(key=lambda x: x['date'])  # Ordenar cronológicamente
+
+        # 2. KPI: Tiempo Promedio Global (minutos)
+        avg_minutes = 0
+        if prep_times:
+            avg_seconds = sum(prep_times) / len(prep_times)
+            avg_minutes = round(avg_seconds / 60, 1)
+
+        # 3. Gráfico: Tiempo por Producto
+        prep_time_chart = []
+        for name, times in prep_times_by_product.items():
+            avg_prod_seconds = sum(times) / len(times)
+            prep_time_chart.append({
+                "product": name,
+                "minutes": round(avg_prod_seconds / 60, 1)
+            })
+        # Ordenar los más lentos primero y tomar Top 10
+        prep_time_chart.sort(key=lambda x: x['minutes'], reverse=True)
+        prep_time_chart = prep_time_chart[:10]
+
+        # 4. Top Ventas
+        top_products_list = [
+            {"product_name": name, "total": count}
+            for name, count in product_counts.items()
+        ]
+        top_products_list.sort(key=lambda x: x['total'], reverse=True)
+        top_products_list = top_products_list[:5]
+
+        return Response({
+            "kpi": {
+                "total_sales": total_sales,
+                "orders_count": orders.count(),
+                "avg_prep_time_minutes": avg_minutes,
+            },
+            "top_products": top_products_list,
+            "prep_time_by_product": prep_time_chart,
+            "sales_history": sales_history
+        })
